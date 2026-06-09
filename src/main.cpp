@@ -1531,7 +1531,7 @@ String getChartDataMonth() {
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n\n=== Nur_Cisterne Monitor ===");
+  Serial.println("\n\n=== CisterneRegen & Dach Monitor ===");
   
   // LittleFS initialisieren
   Serial.println("Initialisiere LittleFS...");

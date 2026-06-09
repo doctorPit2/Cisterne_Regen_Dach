@@ -1,4 +1,4 @@
-# Nur_Cisterne Monitor
+# CisterneRegen & Dach Monitor
 
 ## Übersicht
 Dieses Projekt empfängt **nur die Cisternendaten** via ESP-NOW und zeigt sie auf einem TFT-Display sowie auf einer Webseite an. Die Daten werden mit NTP-Zeit versehen.
