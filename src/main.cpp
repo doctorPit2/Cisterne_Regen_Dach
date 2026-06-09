@@ -43,6 +43,23 @@ typedef struct {
   unsigned long lastPumpDuration;  // Letzte Pumpdauer in Sekunden
 } WaterLevelData;
 
+// Datenstruktur für Wetterdaten vom Dach (muss identisch mit Sender sein!)
+typedef struct {
+  float STX;
+  float Speed;
+  float Dir;
+  float Hum;
+  float Taupunkt;
+  float Temp;
+  float Press;
+  float sectic;
+  float Regentic;
+  float bmp085;
+  float speedinv;
+  float calcCheck;
+  unsigned long timestamp;
+} WetterDachData;
+
 // Historische Daten für Chart
 #define MAX_HISTORY 2000  // RAM-Buffer: Maximale Anzahl an Datenpunkten (bei 30-Min-Intervall = ~41 Tage)
 #define MAX_ARCHIVE 10000  // Maximale Anzahl an archivierten Datenpunkten
@@ -91,6 +108,11 @@ unsigned long lastReceiveTime = 0;
 String lastUpdateTime = "Warte auf Daten...";
 bool displayInitialized = false;
 int rssiValue = 0;  // RSSI-Wert in dBm
+
+// Wetterdaten vom Dach
+WetterDachData wetter_Dach;
+bool wetterDataReceived = false;
+uint8_t wetterSenderMAC[] = {0xd4, 0xe9, 0xf4, 0xe4, 0x2B, 0x04};  // MAC des Wetter-Senders
 
 // Display-Modi
 enum DisplayMode {
@@ -600,7 +622,39 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *data, int data_len) {
   Serial.printf("  Datenlänge: %d Bytes\n", data_len);
   Serial.println("==================================================");
   
-  if (data_len == sizeof(WaterLevelData)) {
+  // Prüfe, ob es Wetterdaten vom Dach sind
+  bool isWetterSender = true;
+  for (int i = 0; i < 6; i++) {
+    if (mac_addr[i] != wetterSenderMAC[i]) {
+      isWetterSender = false;
+      break;
+    }
+  }
+  
+  if (isWetterSender && data_len == sizeof(WetterDachData)) {
+    // Wetterdaten empfangen
+    memcpy(&wetter_Dach, data, sizeof(WetterDachData));
+    wetterDataReceived = true;
+    
+    Serial.println(">>> WETTERDATEN VOM DACH <<<");
+    Serial.printf("  STX:          %.2f\n", wetter_Dach.STX);
+    Serial.printf("  Speed:        %.2f\n", wetter_Dach.Speed);
+    Serial.printf("  Dir:          %.2f\n", wetter_Dach.Dir);
+    Serial.printf("  Hum:          %.2f %%\n", wetter_Dach.Hum);
+    Serial.printf("  Taupunkt:     %.2f °C\n", wetter_Dach.Taupunkt);
+    Serial.printf("  Temp:         %.2f °C\n", wetter_Dach.Temp);
+    Serial.printf("  Press:        %.2f hPa\n", wetter_Dach.Press);
+    Serial.printf("  sectic:       %.2f\n", wetter_Dach.sectic);
+    Serial.printf("  Regentic:     %.2f\n", wetter_Dach.Regentic);
+    Serial.printf("  bmp085:       %.2f\n", wetter_Dach.bmp085);
+    Serial.printf("  speedinv:     %.2f\n", wetter_Dach.speedinv);
+    Serial.printf("  calcCheck:    %.2f\n", wetter_Dach.calcCheck);
+    Serial.printf("  Timestamp:    %lu\n", wetter_Dach.timestamp);
+    Serial.printf("  RSSI:         %d dBm\n", rssiValue);
+    Serial.println("==================================================");
+    
+  } else if (data_len == sizeof(WaterLevelData)) {
+    // Cisternendaten empfangen
     memcpy(&cisterne, data, sizeof(WaterLevelData));
     dataReceived = true;
     lastReceiveTime = millis();
@@ -639,8 +693,9 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *data, int data_len) {
     Serial.printf("  RSSI: %d dBm\n", rssiValue);
   } else {
     Serial.println("WARNUNG: Datenlänge stimmt nicht überein!");
-    Serial.printf("  Erwartet: %d Bytes, Erhalten: %d Bytes\n", 
-                  sizeof(WaterLevelData), data_len);
+    Serial.printf("  Erwartet für Wetter: %d Bytes\n", sizeof(WetterDachData));
+    Serial.printf("  Erwartet für Cisterne: %d Bytes\n", sizeof(WaterLevelData));
+    Serial.printf("  Erhalten: %d Bytes\n", data_len);
   }
 }
 
