@@ -44,10 +44,10 @@ typedef struct {
 } WaterLevelData;
 
 // Historische Daten für Chart
-#define MAX_HISTORY 2000  // RAM-Buffer: Maximale Anzahl an Datenpunkten (bei 5-Min-Intervall = ~7 Tage)
+#define MAX_HISTORY 2000  // RAM-Buffer: Maximale Anzahl an Datenpunkten (bei 30-Min-Intervall = ~41 Tage)
 #define MAX_ARCHIVE 10000  // Maximale Anzahl an archivierten Datenpunkten
 #define ARCHIVE_BATCH 200  // Anzahl Punkte pro Archivierung
-#define DATA_POINT_INTERVAL 300  // Datenaufzeichnung alle 5 Minuten (300 Sekunden)
+#define DATA_POINT_INTERVAL 1800  // Datenaufzeichnung alle 30 Minuten (1800 Sekunden)
 
 struct DataPoint {
   unsigned long timestamp;  // Unix-Timestamp
@@ -519,11 +519,11 @@ void trackPumpEvents() {
     if (getLocalTime(&timeinfo)) {
       time_t now = mktime(&timeinfo);
       if (currentCycleStartTime == 0 || (now - lastPumpEndTime) > 300) {
-        // Neuer Zyklus - Archiv und Historie löschen
-        Serial.println("Neuer Füllzyklus erkannt - Historie wird zurückgesetzt");
-        clearArchiveForNewCycle();
-        historyCount = 0;
-        historyIndex = 0;
+        // Neuer Zyklus - nur Startzeit setzen, Historie für Monatsübersicht beibehalten
+        Serial.println("Neuer Füllzyklus erkannt - Zyklusstartzeit wird aktualisiert (Historie bleibt erhalten)");
+        // clearArchiveForNewCycle();  // DEAKTIVIERT - Archiv für Monatsübersicht behalten
+        // historyCount = 0;  // DEAKTIVIERT - Historie für Monatsübersicht behalten
+        // historyIndex = 0;  // DEAKTIVIERT - Historie für Monatsübersicht behalten
         currentCycleStartTime = now;
       }
     }
@@ -543,18 +543,10 @@ void trackPumpEvents() {
     unsigned long now = time(nullptr);
     currentCycleStartTime = now;  // Neuer Füllzyklus beginnt
     
-    // Historie komplett zurücksetzen für neuen Füllzyklus
-    historyCount = 0;
-    historyIndex = 0;
+    // WICHTIG: Historie NICHT löschen - wird für Monatsübersicht benötigt!
+    // Der Chart des aktuellen Zyklus filtert automatisch ab currentCycleStartTime
     
-    // WICHTIG: Alle timestamps auf 0 setzen, damit alte Daten nicht mehr angezeigt werden
-    for (int i = 0; i < MAX_HISTORY; i++) {
-      history[i].timestamp = 0;
-      history[i].waterLevel = 0;
-      history[i].pumpActive = false;
-    }
-    
-    Serial.printf("Pump gestoppt um: %lu - Neuer Füllzyklus beginnt, Historie komplett gelöscht\n", now);
+    Serial.printf("Pump gestoppt um: %lu - Neuer Füllzyklus beginnt (Historie bleibt für Monatsübersicht erhalten)\n", now);
     saveNeeded = true;  // Wichtiges Event - sofort speichern
   }
   
@@ -599,6 +591,15 @@ void promiscuous_rx_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
 
 // ESP-NOW Callback wenn Daten empfangen werden
 void OnDataRecv(const uint8_t *mac_addr, const uint8_t *data, int data_len) {
+  // MAC-Adresse des Senders anzeigen
+  Serial.println("==================================================");
+  Serial.println("ESP-NOW Daten empfangen von Sender:");
+  Serial.printf("  MAC-Adresse: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                mac_addr[0], mac_addr[1], mac_addr[2], 
+                mac_addr[3], mac_addr[4], mac_addr[5]);
+  Serial.printf("  Datenlänge: %d Bytes\n", data_len);
+  Serial.println("==================================================");
+  
   if (data_len == sizeof(WaterLevelData)) {
     memcpy(&cisterne, data, sizeof(WaterLevelData));
     dataReceived = true;
@@ -614,7 +615,7 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *data, int data_len) {
       lastUpdateTime = String(timeStr);
     }
     
-    // Historische Daten speichern (nur alle 5 Minuten, außer bei Pumpen-Statuswechsel)
+    // Historische Daten speichern (nur alle 30 Minuten, außer bei Pumpen-Statuswechsel)
     time_t now = time(nullptr);
     bool pumpStatusChanged = (cisterne.pumpActive != wasPumpActive);
     bool intervalElapsed = (now - lastDataPointTime) >= DATA_POINT_INTERVAL;
@@ -636,6 +637,10 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *data, int data_len) {
     Serial.printf("  Pumpen-Alarm: %s\n", cisterne.pumpAlarm ? "JA" : "NEIN");
     Serial.printf("  Letzte Pumpdauer: %lu s\n", cisterne.lastPumpDuration);
     Serial.printf("  RSSI: %d dBm\n", rssiValue);
+  } else {
+    Serial.println("WARNUNG: Datenlänge stimmt nicht überein!");
+    Serial.printf("  Erwartet: %d Bytes, Erhalten: %d Bytes\n", 
+                  sizeof(WaterLevelData), data_len);
   }
 }
 
@@ -1244,7 +1249,8 @@ String getJsonData() {
   json += "\"timeBetweenPumps\":" + String(timeBetweenPumps) + ",";
   json += "\"timeBetweenPumpsFormatted\":\"" + formatTimeDifference(timeBetweenPumps) + "\",";
   json += "\"lastPumpStartTime\":" + String(lastPumpStartTime) + ",";
-  json += "\"currentPumpStartTime\":" + String(currentPumpStartTime);
+  json += "\"currentPumpStartTime\":" + String(currentPumpStartTime) + ",";
+  json += "\"currentCycleStartTime\":" + String(currentCycleStartTime);
   
   json += "}";
   return json;
@@ -1327,6 +1333,139 @@ String getChartData() {
   doc["pointsCount"] = pointsAdded;
   doc["currentPumpStartTime"] = currentCycleStartTime;
   doc["ramCount"] = historyCount;
+  
+  // Zu String serialisieren
+  String output;
+  serializeJson(doc, output);
+  
+  return output;
+}
+
+// JSON-Daten für Monats-Chart (alle Daten der letzten 30 Tage - inkl. Archiv)
+String getChartDataMonth() {
+  const int MAX_WEB_POINTS = 500;  // Maximal 500 Punkte für Monatsansicht
+  const unsigned long MONTH_SECONDS = 30UL * 24UL * 3600UL;  // 30 Tage
+  
+  unsigned long now = time(nullptr);
+  unsigned long monthAgo = now - MONTH_SECONDS;
+  
+  // Prüfe, ob wir Archiv-Daten benötigen
+  bool needArchive = false;
+  unsigned long oldestRamTime = 0;
+  
+  if (historyCount > 0) {
+    int ramStartIdx = (historyIndex - historyCount + MAX_HISTORY) % MAX_HISTORY;
+    oldestRamTime = history[ramStartIdx].timestamp;
+    needArchive = (oldestRamTime > monthAgo && archiveStats.count > 0 && archiveStats.oldestTime < monthAgo);
+  } else if (archiveStats.count > 0) {
+    needArchive = true;
+  } else {
+    return "{\"pointsCount\":0}";
+  }
+  
+  // JSON-Dokument für Ausgabe erstellen
+  DynamicJsonDocument doc(MAX_WEB_POINTS * 40 + 1024);
+  JsonArray waterLevels = doc.createNestedArray("waterLevels");
+  JsonArray pumpStates = doc.createNestedArray("pumpStates");
+  JsonArray timestamps = doc.createNestedArray("timestamps");
+  
+  int totalValidPoints = 0;
+  
+  // Schritt 1: Archiv-Daten zählen (falls benötigt)
+  int archiveValidCount = 0;
+  if (needArchive && LittleFS.exists(ARCHIVE_FILE)) {
+    File file = LittleFS.open(ARCHIVE_FILE, "r");
+    if (file) {
+      DynamicJsonDocument archiveDoc(MAX_ARCHIVE * 64 + 2048);
+      DeserializationError error = deserializeJson(archiveDoc, file);
+      file.close();
+      
+      if (!error) {
+        JsonArray archiveArray = archiveDoc["data"].as<JsonArray>();
+        for (JsonObject point : archiveArray) {
+          unsigned long ts = point["ts"] | 0;
+          if (ts >= monthAgo && ts <= now) {
+            archiveValidCount++;
+          }
+        }
+      }
+    }
+  }
+  
+  // Schritt 2: RAM-Daten zählen
+  int ramValidCount = 0;
+  int ramStartIdx = (historyIndex - historyCount + MAX_HISTORY) % MAX_HISTORY;
+  for (int i = 0; i < historyCount; i++) {
+    int idx = (ramStartIdx + i) % MAX_HISTORY;
+    if (history[idx].timestamp >= monthAgo && history[idx].timestamp <= now) {
+      ramValidCount++;
+    }
+  }
+  
+  totalValidPoints = archiveValidCount + ramValidCount;
+  
+  if (totalValidPoints == 0) {
+    return "{\"pointsCount\":0}";
+  }
+  
+  // Schritt 3: Sampling-Strategie bestimmen
+  float samplingStep = (totalValidPoints > MAX_WEB_POINTS) ? (float)totalValidPoints / MAX_WEB_POINTS : 1.0;
+  int pointsAdded = 0;
+  int validIdx = 0;
+  
+  // Schritt 4: Archiv-Daten sampeln und hinzufügen
+  if (needArchive && LittleFS.exists(ARCHIVE_FILE)) {
+    File file = LittleFS.open(ARCHIVE_FILE, "r");
+    if (file) {
+      DynamicJsonDocument archiveDoc(MAX_ARCHIVE * 64 + 2048);
+      DeserializationError error = deserializeJson(archiveDoc, file);
+      file.close();
+      
+      if (!error) {
+        JsonArray archiveArray = archiveDoc["data"].as<JsonArray>();
+        for (JsonObject point : archiveArray) {
+          unsigned long ts = point["ts"] | 0;
+          if (ts >= monthAgo && ts <= now) {
+            // Sampling-Entscheidung
+            if (samplingStep <= 1.0 || validIdx == 0 || validIdx >= (int)(pointsAdded * samplingStep)) {
+              float wl = point["wl"] | 0.0f;
+              bool pa = point["pa"] | false;
+              
+              waterLevels.add(serialized(String(wl, 1)));
+              pumpStates.add(pa);
+              timestamps.add(ts);
+              pointsAdded++;
+              
+              if (pointsAdded >= MAX_WEB_POINTS) break;
+            }
+            validIdx++;
+          }
+        }
+      }
+    }
+  }
+  
+  // Schritt 5: RAM-Daten sampeln und hinzufügen
+  if (pointsAdded < MAX_WEB_POINTS) {
+    for (int i = 0; i < historyCount && pointsAdded < MAX_WEB_POINTS; i++) {
+      int idx = (ramStartIdx + i) % MAX_HISTORY;
+      if (history[idx].timestamp >= monthAgo && history[idx].timestamp <= now) {
+        // Sampling-Entscheidung
+        if (samplingStep <= 1.0 || validIdx == 0 || validIdx >= (int)(pointsAdded * samplingStep)) {
+          waterLevels.add(serialized(String(history[idx].waterLevel, 1)));
+          pumpStates.add(history[idx].pumpActive);
+          timestamps.add(history[idx].timestamp);
+          pointsAdded++;
+        }
+        validIdx++;
+      }
+    }
+  }
+  
+  doc["pointsCount"] = pointsAdded;
+  doc["oldestTimestamp"] = pointsAdded > 0 ? timestamps[0].as<unsigned long>() : 0;
+  doc["newestTimestamp"] = pointsAdded > 0 ? timestamps[pointsAdded - 1].as<unsigned long>() : 0;
+  doc["usedArchive"] = needArchive;
   
   // Zu String serialisieren
   String output;
@@ -1476,63 +1615,98 @@ void setup() {
         body {
             font-family: Arial, sans-serif;
             margin: 0;
-            padding: 20px;
+            padding: 10px;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: white;
             min-height: 100vh;
+            overflow: hidden;
         }
         .container {
             max-width: 1600px;
             margin: 0 auto;
             background: rgba(255, 255, 255, 0.1);
             backdrop-filter: blur(10px);
-            border-radius: 20px;
-            padding: 30px;
+            border-radius: 15px;
+            padding: 15px;
             box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+            max-height: 98vh;
+            overflow: hidden;
         }
         h1 {
             text-align: center;
-            margin-bottom: 30px;
-            font-size: 2.5em;
+            margin: 0 0 15px 0;
+            font-size: 2em;
             text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3);
         }
         .main-layout {
             display: grid;
             grid-template-columns: 1fr 400px;
-            gap: 30px;
-            margin-top: 30px;
+            gap: 20px;
+            margin-top: 10px;
         }
         .chart-section {
             background: rgba(255, 255, 255, 0.95);
             border-radius: 15px;
-            padding: 20px;
-            min-height: 500px;
+            padding: 15px;
+            max-height: 500px;
+            display: flex;
+            flex-direction: column;
+        }
+        .chart-section canvas {
+            flex: 1;
+            max-height: 450px;
+        }
+        .chart-controls {
+            display: flex;
+            justify-content: center;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+        .chart-button {
+            padding: 10px 25px;
+            border: none;
+            border-radius: 10px;
+            font-size: 1em;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.3s;
+            background: rgba(102, 126, 234, 0.3);
+            color: #333;
+        }
+        .chart-button:hover {
+            background: rgba(102, 126, 234, 0.5);
+            transform: translateY(-2px);
+        }
+        .chart-button.active {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
         }
         .data-section {
             display: flex;
             flex-direction: column;
-            gap: 15px;
+            gap: 10px;
+            overflow-y: auto;
         }
         .data-card {
             background: rgba(255, 255, 255, 0.2);
-            border-radius: 15px;
-            padding: 20px;
+            border-radius: 12px;
+            padding: 12px;
             text-align: center;
         }
         .data-label {
-            font-size: 0.9em;
+            font-size: 0.85em;
             opacity: 0.8;
-            margin-bottom: 10px;
+            margin-bottom: 5px;
         }
         .data-value {
-            font-size: 2em;
+            font-size: 1.8em;
             font-weight: bold;
-            margin: 10px 0;
+            margin: 5px 0;
         }
         .data-value-small {
-            font-size: 1.3em;
+            font-size: 1.2em;
             font-weight: bold;
-            margin: 10px 0;
+            margin: 5px 0;
         }
         .data-unit {
             font-size: 0.8em;
@@ -1561,15 +1735,115 @@ void setup() {
         }
         .time-info {
             text-align: center;
-            margin-top: 20px;
-            padding: 15px;
+            margin-top: 10px;
+            padding: 10px;
             background: rgba(255, 255, 255, 0.1);
             border-radius: 10px;
-            font-size: 0.9em;
+            font-size: 0.85em;
         }
         @media (max-width: 1200px) {
             .main-layout {
                 grid-template-columns: 1fr;
+            }
+        }
+        /* Mobile Optimierungen - ab Tablet-Größe */
+        @media (max-width: 768px) {
+            body {
+                overflow-y: auto;
+                padding: 5px;
+            }
+            .container {
+                max-height: none;
+                overflow: visible;
+                padding: 10px;
+            }
+            h1 {
+                font-size: 1.5em;
+                margin: 5px 0 10px 0;
+            }
+            .chart-section {
+                max-height: 400px;
+                padding: 10px;
+            }
+            .chart-section canvas {
+                max-height: 350px;
+            }
+            .chart-controls {
+                flex-wrap: wrap;
+                gap: 8px;
+            }
+            .chart-button {
+                padding: 8px 15px;
+                font-size: 0.9em;
+            }
+            .data-card {
+                padding: 10px;
+            }
+            .data-value {
+                font-size: 1.5em;
+            }
+            .data-value-small {
+                font-size: 1em;
+            }
+        }
+        /* Smartphone-spezifische Optimierungen */
+        @media (max-width: 480px) {
+            body {
+                padding: 5px;
+            }
+            .container {
+                padding: 8px;
+                border-radius: 10px;
+            }
+            h1 {
+                font-size: 1.3em;
+                margin: 5px 0 8px 0;
+            }
+            .main-layout {
+                gap: 10px;
+                margin-top: 5px;
+            }
+            .chart-section {
+                max-height: 300px;
+                padding: 8px;
+            }
+            .chart-section canvas {
+                max-height: 250px;
+            }
+            .chart-controls {
+                gap: 5px;
+                margin-bottom: 10px;
+            }
+            .chart-button {
+                padding: 6px 12px;
+                font-size: 0.85em;
+            }
+            .data-section {
+                gap: 8px;
+            }
+            .data-card {
+                padding: 8px;
+            }
+            .data-label {
+                font-size: 0.8em;
+            }
+            .data-value {
+                font-size: 1.3em;
+            }
+            .data-value-small {
+                font-size: 0.95em;
+            }
+            .data-unit {
+                font-size: 0.75em;
+            }
+            .status {
+                padding: 6px 15px;
+                font-size: 0.9em;
+            }
+            .time-info {
+                padding: 8px;
+                font-size: 0.8em;
+                margin-top: 8px;
             }
         }
     </style>
@@ -1580,6 +1854,14 @@ void setup() {
         
         <div class="main-layout">
             <div class="chart-section">
+                <div class="chart-controls">
+                    <button class="chart-button active" id="btnCycle" onclick="switchToChartMode('cycle')">
+                        📊 Aktueller Zyklus
+                    </button>
+                    <button class="chart-button" id="btnMonth" onclick="switchToChartMode('month')">
+                        📅 Monatsübersicht
+                    </button>
+                </div>
                 <canvas id="waterChart"></canvas>
             </div>
             
@@ -1598,6 +1880,11 @@ void setup() {
                 <div class="data-card">
                     <div class="data-label">Zeit zwischen Pumpvorgängen</div>
                     <div class="data-value-small" id="timeBetween">--</div>
+                </div>
+                
+                <div class="data-card">
+                    <div class="data-label">Füllzyklus Start</div>
+                    <div class="data-value-small" id="cycleStart">--</div>
                 </div>
                 
                 <div class="data-card">
@@ -1625,6 +1912,23 @@ void setup() {
     <script>
         let chart = null;
         let lastPumpStartTime = 0;
+        let chartMode = 'cycle';  // 'cycle' oder 'month'
+        
+        function switchToChartMode(mode) {
+            chartMode = mode;
+            
+            // Button-Status aktualisieren
+            document.getElementById('btnCycle').classList.remove('active');
+            document.getElementById('btnMonth').classList.remove('active');
+            
+            if (mode === 'cycle') {
+                document.getElementById('btnCycle').classList.add('active');
+                updateChart();
+            } else {
+                document.getElementById('btnMonth').classList.add('active');
+                updateMonthChart();
+            }
+        }
         
         function formatDuration(seconds) {
             if (!seconds || seconds === 0) return '--';
@@ -1676,23 +1980,9 @@ void setup() {
                 chartTitle = 'Füllzyklus Start: ' + startTimeStr;
             }
             
-            // Automatische Y-Achsen-Skalierung (mit 10% Puffer)
-            let minWater = Math.min(...waterLevels);
-            let maxWater = Math.max(...waterLevels);
-            let dataRange = maxWater - minWater;
-            
-            if (dataRange < 1.0) dataRange = 1.0;  // Mindestens 1 cm Bereich
-            
-            let buffer = dataRange * 0.1;  // 10% Puffer
-            let yMin = Math.floor((minWater - buffer) * 2) / 2;  // Auf 0.5 abrunden
-            let yMax = Math.ceil((maxWater + buffer) * 2) / 2;   // Auf 0.5 aufrunden
-            
-            // Mindestbereich garantieren
-            if (yMax - yMin < 2.0) {
-                let center = (yMin + yMax) / 2.0;
-                yMin = center - 1.0;
-                yMax = center + 1.0;
-            }
+            // Feste Y-Achsen-Skalierung für Zisterne
+            let yMin = 10.0;  // Fester Minimalwert
+            let yMax = 40.0;  // Fester Maximalwert
             
             // Hintergrundfarben basierend auf Pumpen-Status
             const backgroundColors = pumpStates.map(state => 
@@ -1764,8 +2054,9 @@ void setup() {
                             ticks: {
                                 color: '#333',
                                 font: { size: 12 },
+                                stepSize: 5,
                                 callback: function(value) {
-                                    return value.toFixed(1) + ' cm';
+                                    return value.toFixed(0) + ' cm';
                                 }
                             },
                             grid: { color: 'rgba(0, 0, 0, 0.1)' },
@@ -1823,6 +2114,135 @@ void setup() {
                 .catch(error => console.error('Error fetching chart data:', error));
         }
         
+        function createMonthChart(waterLevels, pumpStates, timestamps) {
+            const ctx = document.getElementById('waterChart').getContext('2d');
+            
+            // Formatierte Labels mit Datum/Uhrzeit
+            const formattedLabels = timestamps.map(ts => formatTimestamp(ts));
+            
+            // Titel für Monatsansicht
+            const oldestDate = new Date(timestamps[0] * 1000);
+            const newestDate = new Date(timestamps[timestamps.length - 1] * 1000);
+            const chartTitle = 'Monatsübersicht: ' + formatTimestamp(timestamps[0]) + ' - ' + 
+                              formatTimestamp(timestamps[timestamps.length - 1]);
+            
+            // Feste Y-Achsen-Skalierung für Zisterne
+            let yMin = 10.0;  // Fester Minimalwert
+            let yMax = 40.0;  // Fester Maximalwert
+            
+            if (chart) {
+                chart.destroy();
+            }
+            
+            chart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: formattedLabels,
+                    datasets: [{
+                        label: 'Wasserstand (cm)',
+                        data: waterLevels,
+                        backgroundColor: 'rgba(99, 102, 241, 0.1)',
+                        borderColor: 'rgba(99, 102, 241, 1)',
+                        borderWidth: 2,
+                        fill: true,
+                        tension: 0.3,
+                        pointBackgroundColor: pumpStates.map(state => 
+                            state ? 'rgba(16, 185, 129, 1)' : 'rgba(99, 102, 241, 1)'
+                        ),
+                        pointBorderColor: '#fff',
+                        pointBorderWidth: 1,
+                        pointRadius: 1,
+                        pointHoverRadius: 5
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            display: true,
+                            position: 'top',
+                            labels: {
+                                color: '#333',
+                                font: { size: 14 }
+                            }
+                        },
+                        title: {
+                            display: true,
+                            text: chartTitle,
+                            color: '#333',
+                            font: { size: 16, weight: 'bold' }
+                        },
+                        tooltip: {
+                            callbacks: {
+                                label: function(context) {
+                                    return 'Wasserstand: ' + context.parsed.y.toFixed(1) + ' cm';
+                                },
+                                afterLabel: function(context) {
+                                    const pumpActive = pumpStates[context.dataIndex];
+                                    const ts = timestamps[context.dataIndex];
+                                    return pumpActive ? '🟢 Pumpe AKTIV' : '⚪ Pumpe AUS';
+                                }
+                            }
+                        }
+                    },
+                    scales: {
+                        y: {
+                            beginAtZero: false,
+                            min: yMin,
+                            max: yMax,
+                            ticks: {
+                                color: '#333',
+                                font: { size: 12 },
+                                stepSize: 5,
+                                callback: function(value) {
+                                    return value.toFixed(0) + ' cm';
+                                }
+                            },
+                            grid: { color: 'rgba(0, 0, 0, 0.1)' },
+                            title: {
+                                display: true,
+                                text: 'Wasserstand (cm)',
+                                color: '#333',
+                                font: { size: 14, weight: 'bold' }
+                            }
+                        },
+                        x: {
+                            ticks: {
+                                color: '#333',
+                                font: { size: 10 },
+                                maxRotation: 45,
+                                minRotation: 45,
+                                autoSkip: true,
+                                maxTicksLimit: 15
+                            },
+                            grid: { 
+                                color: 'rgba(0, 0, 0, 0.05)',
+                                drawOnChartArea: true
+                            },
+                            title: {
+                                display: true,
+                                text: 'Datum / Uhrzeit',
+                                color: '#333',
+                                font: { size: 14, weight: 'bold' }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        
+        function updateMonthChart() {
+            fetch('/chartdata_month')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.timestamps && data.timestamps.length > 0) {
+                        createMonthChart(data.waterLevels, data.pumpStates, data.timestamps);
+                    }
+                })
+                .catch(error => console.error('Error fetching month chart data:', error));
+        }
+        
         function updateData() {
             fetch('/data')
                 .then(response => response.json())
@@ -1838,6 +2258,14 @@ void setup() {
                     // Zeit zwischen Pumpvorgängen
                     document.getElementById('timeBetween').textContent = 
                         data.timeBetweenPumpsFormatted || '--';
+                    
+                    // Füllzyklus Startzeit
+                    if (data.currentCycleStartTime && data.currentCycleStartTime > 0) {
+                        document.getElementById('cycleStart').textContent = 
+                            formatTimestamp(data.currentCycleStartTime);
+                    } else {
+                        document.getElementById('cycleStart').textContent = '--';
+                    }
                     
                     // Pumpen-Status
                     const pumpStatus = document.getElementById('pumpStatus');
@@ -1867,8 +2295,14 @@ void setup() {
         // Update data every 2 seconds
         setInterval(updateData, 2000);
         
-        // Update chart every 10 seconds (OPTIMIERT - weniger Last!)
-        setInterval(updateChart, 10000);
+        // Update chart every 10 seconds (mit Modi-Check)
+        setInterval(function() {
+            if (chartMode === 'cycle') {
+                updateChart();
+            } else if (chartMode === 'month') {
+                updateMonthChart();
+            }
+        }, 10000);
     </script>
 </body>
 </html>
@@ -1881,6 +2315,10 @@ void setup() {
   
   server.on("/chartdata", HTTP_GET, [](AsyncWebServerRequest *request){
     request->send(200, "application/json", getChartData());
+  });
+  
+  server.on("/chartdata_month", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send(200, "application/json", getChartDataMonth());
   });
   
   server.begin();
