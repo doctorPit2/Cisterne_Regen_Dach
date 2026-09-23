@@ -86,6 +86,17 @@ DataPoint history[MAX_HISTORY];
 int historyIndex = 0;
 int historyCount = 0;
 
+// Wetter-Datenstruktur für Chart (nur Regentic)
+struct WeatherDataPoint {
+  unsigned long timestamp;  // Unix-Timestamp
+  float regentic;          // Regentic-Zähler
+};
+
+WeatherDataPoint weatherHistory[MAX_HISTORY];
+int weatherHistoryIndex = 0;
+int weatherHistoryCount = 0;
+unsigned long lastWeatherDataPointTime = 0;  // Zeitpunkt des letzten gespeicherten Wetter-Datenpunkts
+
 // Archiv-Daten (werden bei Bedarf aus LittleFS geladen)
 struct ArchiveStats {
   int count;                // Anzahl archivierter Datenpunkte
@@ -94,6 +105,7 @@ struct ArchiveStats {
 };
 
 ArchiveStats archiveStats = {0, 0, 0};
+ArchiveStats weatherArchiveStats = {0, 0, 0};
 
 // Pump-Event-Tracking
 unsigned long lastPumpStartTime = 0;
@@ -111,6 +123,9 @@ const char* ARCHIVE_FILE = "/history_archive.json";
 const char* ARCHIVE_STATS_FILE = "/archive_stats.json";
 const char* PUMP_FILE = "/pump_events.json";
 const char* CISTERNE_FILE = "/cisterne_data.json";
+const char* WEATHER_HISTORY_FILE = "/weather_history.json";
+const char* WEATHER_ARCHIVE_FILE = "/weather_archive.json";
+const char* WEATHER_ARCHIVE_STATS_FILE = "/weather_archive_stats.json";
 
 WaterLevelData cisterne;
 bool dataReceived = false;
@@ -500,10 +515,184 @@ void clearArchiveForNewCycle() {
   Serial.println("Archiv gelöscht");
 }
 
+// ============================================================================
+// Wetterdaten (Regentic) speichern und laden
+// ============================================================================
+void saveWeatherHistoryToFS() {
+  Serial.println("Speichere Wetter-Historie auf LittleFS...");
+  
+  File file = LittleFS.open(WEATHER_HISTORY_FILE, "w");
+  if (!file) {
+    Serial.println("Fehler beim Öffnen der Wetter-History-Datei zum Schreiben");
+    return;
+  }
+  
+  DynamicJsonDocument doc(MAX_HISTORY * 64 + 1024);
+  JsonArray dataArray = doc.createNestedArray("data");
+  
+  int startIdx = (weatherHistoryIndex - weatherHistoryCount + MAX_HISTORY) % MAX_HISTORY;
+  for (int i = 0; i < weatherHistoryCount; i++) {
+    int idx = (startIdx + i) % MAX_HISTORY;
+    JsonObject point = dataArray.createNestedObject();
+    point["ts"] = weatherHistory[idx].timestamp;
+    point["rt"] = weatherHistory[idx].regentic;
+  }
+  
+  doc["count"] = weatherHistoryCount;
+  doc["index"] = weatherHistoryIndex;
+  
+  if (serializeJson(doc, file) == 0) {
+    Serial.println("Fehler beim Schreiben der Wetter-JSON-Daten");
+  } else {
+    Serial.printf("Wetter-Historie gespeichert: %d Datenpunkte\n", weatherHistoryCount);
+  }
+  
+  file.close();
+}
+
+void loadWeatherHistoryFromFS() {
+  Serial.println("Lade Wetter-Historie von LittleFS...");
+  
+  if (!LittleFS.exists(WEATHER_HISTORY_FILE)) {
+    Serial.println("Keine gespeicherte Wetter-Historie gefunden");
+    return;
+  }
+  
+  File file = LittleFS.open(WEATHER_HISTORY_FILE, "r");
+  if (!file) {
+    Serial.println("Fehler beim Öffnen der Wetter-History-Datei zum Lesen");
+    return;
+  }
+  
+  DynamicJsonDocument doc(MAX_HISTORY * 64 + 1024);
+  DeserializationError error = deserializeJson(doc, file);
+  file.close();
+  
+  if (error) {
+    Serial.print("Fehler beim Parsen der Wetter-JSON-Daten: ");
+    Serial.println(error.c_str());
+    return;
+  }
+  
+  weatherHistoryCount = doc["count"] | 0;
+  weatherHistoryIndex = doc["index"] | 0;
+  
+  JsonArray dataArray = doc["data"];
+  int loadedPoints = 0;
+  
+  for (JsonObject point : dataArray) {
+    if (loadedPoints < MAX_HISTORY) {
+      weatherHistory[loadedPoints].timestamp = point["ts"] | 0;
+      weatherHistory[loadedPoints].regentic = point["rt"] | 0.0;
+      loadedPoints++;
+    }
+  }
+  
+  Serial.printf("Wetter-Historie geladen: %d Datenpunkte wiederhergestellt\n", weatherHistoryCount);
+}
+
+void saveWeatherArchiveStats() {
+  File file = LittleFS.open(WEATHER_ARCHIVE_STATS_FILE, "w");
+  if (file) {
+    DynamicJsonDocument doc(256);
+    doc["count"] = weatherArchiveStats.count;
+    doc["oldestTime"] = weatherArchiveStats.oldestTime;
+    doc["newestTime"] = weatherArchiveStats.newestTime;
+    serializeJson(doc, file);
+    file.close();
+  }
+}
+
+void loadWeatherArchiveStats() {
+  if (!LittleFS.exists(WEATHER_ARCHIVE_STATS_FILE)) {
+    return;
+  }
+  
+  File file = LittleFS.open(WEATHER_ARCHIVE_STATS_FILE, "r");
+  if (file) {
+    DynamicJsonDocument doc(256);
+    deserializeJson(doc, file);
+    weatherArchiveStats.count = doc["count"] | 0;
+    weatherArchiveStats.oldestTime = doc["oldestTime"] | 0;
+    weatherArchiveStats.newestTime = doc["newestTime"] | 0;
+    file.close();
+    Serial.printf("Wetter-Archiv-Stats: %d Punkte (%lu - %lu)\n", 
+                  weatherArchiveStats.count, weatherArchiveStats.oldestTime, weatherArchiveStats.newestTime);
+  }
+}
+
+void archiveOldWeatherData() {
+  if (weatherHistoryCount < ARCHIVE_BATCH) {
+    return;
+  }
+  
+  Serial.println("Archiviere alte Wetterdaten...");
+  
+  DynamicJsonDocument archiveDoc(MAX_ARCHIVE * 64 + 2048);
+  JsonArray archiveArray;
+  
+  if (LittleFS.exists(WEATHER_ARCHIVE_FILE)) {
+    File file = LittleFS.open(WEATHER_ARCHIVE_FILE, "r");
+    if (file) {
+      deserializeJson(archiveDoc, file);
+      file.close();
+    }
+  }
+  
+  archiveArray = archiveDoc["data"].as<JsonArray>();
+  if (archiveArray.isNull()) {
+    archiveArray = archiveDoc.createNestedArray("data");
+  }
+  
+  int startIdx = (weatherHistoryIndex - weatherHistoryCount + MAX_HISTORY) % MAX_HISTORY;
+  for (int i = 0; i < ARCHIVE_BATCH && weatherHistoryCount > 0; i++) {
+    int idx = (startIdx + i) % MAX_HISTORY;
+    JsonObject point = archiveArray.createNestedObject();
+    point["ts"] = weatherHistory[idx].timestamp;
+    point["rt"] = weatherHistory[idx].regentic;
+    
+    if (weatherHistory[idx].timestamp < weatherArchiveStats.oldestTime || weatherArchiveStats.oldestTime == 0) {
+      weatherArchiveStats.oldestTime = weatherHistory[idx].timestamp;
+    }
+    if (weatherHistory[idx].timestamp > weatherArchiveStats.newestTime) {
+      weatherArchiveStats.newestTime = weatherHistory[idx].timestamp;
+    }
+  }
+  
+  weatherArchiveStats.count = archiveArray.size();
+  
+  while (weatherArchiveStats.count > MAX_ARCHIVE) {
+    archiveArray.remove(0);
+    weatherArchiveStats.count--;
+    if (weatherArchiveStats.count > 0) {
+      weatherArchiveStats.oldestTime = archiveArray[0]["ts"];
+    }
+  }
+  
+  File file = LittleFS.open(WEATHER_ARCHIVE_FILE, "w");
+  if (file) {
+    serializeJson(archiveDoc, file);
+    file.close();
+    saveWeatherArchiveStats();
+    Serial.printf("Wetter-Archiv gespeichert: %d Punkte\n", weatherArchiveStats.count);
+  }
+  
+  int newCount = weatherHistoryCount - ARCHIVE_BATCH;
+  for (int i = 0; i < newCount; i++) {
+    int srcIdx = (startIdx + ARCHIVE_BATCH + i) % MAX_HISTORY;
+    weatherHistory[i] = weatherHistory[srcIdx];
+  }
+  weatherHistoryIndex = newCount;
+  weatherHistoryCount = newCount;
+  
+  Serial.printf("Wetter-RAM-Buffer bereinigt: %d Punkte verbleiben\n", weatherHistoryCount);
+}
+
 void saveAllData() {
   saveHistoryToFS();
   savePumpEventsToFS();
   saveCisterneDataToFS();
+  saveWeatherHistoryToFS();
 }
 
 // ============================================================================
@@ -571,6 +760,8 @@ void loadAllData() {
   loadArchiveStats();   // Archiv-Statistiken laden
   loadPumpEventsFromFS();
   loadCisterneDataFromFS();
+  loadWeatherHistoryFromFS();
+  loadWeatherArchiveStats();
   
   Serial.println("Alle Daten geladen - Chart-Historie nach Reset wiederhergestellt");
 }
@@ -596,6 +787,27 @@ void addDataPoint(float waterLevel, bool pumpActive) {
   } else {
     // Buffer ist voll - archiviere älteste Daten
     archiveOldData();
+  }
+}
+
+// Wetterdaten (Regentic) historisch speichern
+void addWeatherDataPoint(float regentic) {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    return;  // Keine gültige Zeit
+  }
+  
+  time_t now = mktime(&timeinfo);
+  
+  weatherHistory[weatherHistoryIndex].timestamp = now;
+  weatherHistory[weatherHistoryIndex].regentic = regentic;
+  
+  weatherHistoryIndex = (weatherHistoryIndex + 1) % MAX_HISTORY;
+  if (weatherHistoryCount < MAX_HISTORY) {
+    weatherHistoryCount++;
+  } else {
+    // Buffer ist voll - archiviere älteste Daten
+    archiveOldWeatherData();
   }
 }
 
@@ -721,6 +933,16 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *data, int data_len) {
     Serial.printf("  Timestamp:    %lu\n", wetter_Dach.timestamp);
     Serial.printf("  RSSI:         %d dBm\n", rssiValue);
     Serial.println("==================================================");
+    
+    // Regentic-Daten historisch speichern (alle 30 Minuten)
+    time_t now = time(nullptr);
+    bool intervalElapsed = (now - lastWeatherDataPointTime) >= DATA_POINT_INTERVAL;
+    
+    if (intervalElapsed || lastWeatherDataPointTime == 0) {
+      addWeatherDataPoint(wetter_Dach.Regentic);
+      lastWeatherDataPointTime = now;
+      Serial.printf("Regentic-Datenpunkt gespeichert: %.2f\n", wetter_Dach.Regentic);
+    }
     
   } else if (data_len == sizeof(WaterLevelData)) {
     // Cisternendaten empfangen
@@ -1598,6 +1820,176 @@ String getChartDataMonth() {
   return output;
 }
 
+// JSON-Daten für Regentic-Chart (Monatsübersicht mit Waterlevel-Korrelation)
+String getRegenticChartDataMonth() {
+  const int MAX_WEB_POINTS = 500;  // Maximal 500 Punkte für Monatsansicht
+  const unsigned long MONTH_SECONDS = 30UL * 24UL * 3600UL;  // 30 Tage
+  
+  unsigned long now = time(nullptr);
+  unsigned long monthAgo = now - MONTH_SECONDS;
+  
+  // Prüfe, ob wir Wetter-Archiv-Daten benötigen
+  bool needWeatherArchive = false;
+  unsigned long oldestWeatherRamTime = 0;
+  
+  if (weatherHistoryCount > 0) {
+    int ramStartIdx = (weatherHistoryIndex - weatherHistoryCount + MAX_HISTORY) % MAX_HISTORY;
+    oldestWeatherRamTime = weatherHistory[ramStartIdx].timestamp;
+    needWeatherArchive = (oldestWeatherRamTime > monthAgo && weatherArchiveStats.count > 0 && weatherArchiveStats.oldestTime < monthAgo);
+  } else if (weatherArchiveStats.count > 0) {
+    needWeatherArchive = true;
+  } else {
+    return "{\"pointsCount\":0}";
+  }
+  
+  // JSON-Dokument für Ausgabe erstellen
+  DynamicJsonDocument doc(MAX_WEB_POINTS * 60 + 1024);
+  JsonArray regenticValues = doc.createNestedArray("regenticValues");
+  JsonArray waterLevels = doc.createNestedArray("waterLevels");
+  JsonArray timestamps = doc.createNestedArray("timestamps");
+  
+  int totalValidPoints = 0;
+  
+  // Schritt 1: Archiv-Daten zählen (falls benötigt)
+  int archiveValidCount = 0;
+  if (needWeatherArchive && LittleFS.exists(WEATHER_ARCHIVE_FILE)) {
+    File file = LittleFS.open(WEATHER_ARCHIVE_FILE, "r");
+    if (file) {
+      DynamicJsonDocument archiveDoc(MAX_ARCHIVE * 64 + 2048);
+      DeserializationError error = deserializeJson(archiveDoc, file);
+      file.close();
+      
+      if (!error) {
+        JsonArray archiveArray = archiveDoc["data"].as<JsonArray>();
+        for (JsonObject point : archiveArray) {
+          unsigned long ts = point["ts"] | 0;
+          if (ts >= monthAgo && ts <= now) {
+            archiveValidCount++;
+          }
+        }
+      }
+    }
+  }
+  
+  // Schritt 2: RAM-Daten zählen
+  int ramValidCount = 0;
+  int ramStartIdx = (weatherHistoryIndex - weatherHistoryCount + MAX_HISTORY) % MAX_HISTORY;
+  for (int i = 0; i < weatherHistoryCount; i++) {
+    int idx = (ramStartIdx + i) % MAX_HISTORY;
+    if (weatherHistory[idx].timestamp >= monthAgo && weatherHistory[idx].timestamp <= now) {
+      ramValidCount++;
+    }
+  }
+  
+  totalValidPoints = archiveValidCount + ramValidCount;
+  
+  if (totalValidPoints == 0) {
+    return "{\"pointsCount\":0}";
+  }
+  
+  // Schritt 3: Sampling-Strategie bestimmen
+  float samplingStep = (totalValidPoints > MAX_WEB_POINTS) ? (float)totalValidPoints / MAX_WEB_POINTS : 1.0;
+  int pointsAdded = 0;
+  int validIdx = 0;
+  
+  // Schritt 4: Archiv-Daten sampeln und hinzufügen
+  if (needWeatherArchive && LittleFS.exists(WEATHER_ARCHIVE_FILE)) {
+    File file = LittleFS.open(WEATHER_ARCHIVE_FILE, "r");
+    if (file) {
+      DynamicJsonDocument archiveDoc(MAX_ARCHIVE * 64 + 2048);
+      DeserializationError error = deserializeJson(archiveDoc, file);
+      file.close();
+      
+      if (!error) {
+        JsonArray archiveArray = archiveDoc["data"].as<JsonArray>();
+        for (JsonObject point : archiveArray) {
+          unsigned long ts = point["ts"] | 0;
+          if (ts >= monthAgo && ts <= now) {
+            // Sampling-Entscheidung
+            if (samplingStep <= 1.0 || validIdx == 0 || validIdx >= (int)(pointsAdded * samplingStep)) {
+              float rt = point["rt"] | 0.0f;
+              
+              // Finde korrespondierenden Waterlevel aus history
+              float wl = 0.0f;
+              // Suche nächsten Waterlevel-Datenpunkt (±30 Min)
+              if (historyCount > 0) {
+                int histStartIdx = (historyIndex - historyCount + MAX_HISTORY) % MAX_HISTORY;
+                unsigned long minTimeDiff = 1800;  // 30 Minuten Toleranz
+                for (int j = 0; j < historyCount; j++) {
+                  int hidx = (histStartIdx + j) % MAX_HISTORY;
+                  unsigned long timeDiff = (ts > history[hidx].timestamp) 
+                                          ? (ts - history[hidx].timestamp) 
+                                          : (history[hidx].timestamp - ts);
+                  if (timeDiff < minTimeDiff) {
+                    minTimeDiff = timeDiff;
+                    wl = history[hidx].waterLevel;
+                  }
+                }
+              }
+              
+              regenticValues.add(serialized(String(rt, 0)));
+              waterLevels.add(serialized(String(wl, 1)));
+              timestamps.add(ts);
+              pointsAdded++;
+              
+              if (pointsAdded >= MAX_WEB_POINTS) break;
+            }
+            validIdx++;
+          }
+        }
+      }
+    }
+  }
+  
+  // Schritt 5: RAM-Daten sampeln und hinzufügen
+  if (pointsAdded < MAX_WEB_POINTS) {
+    for (int i = 0; i < weatherHistoryCount && pointsAdded < MAX_WEB_POINTS; i++) {
+      int idx = (ramStartIdx + i) % MAX_HISTORY;
+      if (weatherHistory[idx].timestamp >= monthAgo && weatherHistory[idx].timestamp <= now) {
+        // Sampling-Entscheidung
+        if (samplingStep <= 1.0 || validIdx == 0 || validIdx >= (int)(pointsAdded * samplingStep)) {
+          unsigned long ts = weatherHistory[idx].timestamp;
+          float rt = weatherHistory[idx].regentic;
+          
+          // Finde korrespondierenden Waterlevel
+          float wl = 0.0f;
+          if (historyCount > 0) {
+            int histStartIdx = (historyIndex - historyCount + MAX_HISTORY) % MAX_HISTORY;
+            unsigned long minTimeDiff = 1800;
+            for (int j = 0; j < historyCount; j++) {
+              int hidx = (histStartIdx + j) % MAX_HISTORY;
+              unsigned long timeDiff = (ts > history[hidx].timestamp) 
+                                      ? (ts - history[hidx].timestamp) 
+                                      : (history[hidx].timestamp - ts);
+              if (timeDiff < minTimeDiff) {
+                minTimeDiff = timeDiff;
+                wl = history[hidx].waterLevel;
+              }
+            }
+          }
+          
+          regenticValues.add(serialized(String(rt, 0)));
+          waterLevels.add(serialized(String(wl, 1)));
+          timestamps.add(ts);
+          pointsAdded++;
+        }
+        validIdx++;
+      }
+    }
+  }
+  
+  doc["pointsCount"] = pointsAdded;
+  doc["oldestTimestamp"] = pointsAdded > 0 ? timestamps[0].as<unsigned long>() : 0;
+  doc["newestTimestamp"] = pointsAdded > 0 ? timestamps[pointsAdded - 1].as<unsigned long>() : 0;
+  doc["usedArchive"] = needWeatherArchive;
+  
+  // Zu String serialisieren
+  String output;
+  serializeJson(doc, output);
+  
+  return output;
+}
+
 void setup() {
   Serial.begin(115200);
   Serial.println("\n\n=== CisterneRegen & Dach Monitor ===");
@@ -1996,6 +2388,9 @@ void setup() {
                     <button class="chart-button" id="btnMonth" onclick="switchToChartMode('month')">
                         📅 Monatsübersicht
                     </button>
+                    <button class="chart-button" id="btnRegentic" onclick="switchToChartMode('regentic')">
+                        🌧️ Regentic + Waterlevel
+                    </button>
                 </div>
                 <canvas id="waterChart"></canvas>
             </div>
@@ -2061,13 +2456,17 @@ void setup() {
             // Button-Status aktualisieren
             document.getElementById('btnCycle').classList.remove('active');
             document.getElementById('btnMonth').classList.remove('active');
+            document.getElementById('btnRegentic').classList.remove('active');
             
             if (mode === 'cycle') {
                 document.getElementById('btnCycle').classList.add('active');
                 updateChart();
-            } else {
+            } else if (mode === 'month') {
                 document.getElementById('btnMonth').classList.add('active');
                 updateMonthChart();
+            } else if (mode === 'regentic') {
+                document.getElementById('btnRegentic').classList.add('active');
+                updateRegenticChart();
             }
         }
         
@@ -2405,6 +2804,176 @@ void setup() {
                 .catch(error => console.error('Error fetching month chart data:', error));
         }
         
+        function updateRegenticChart() {
+            fetch('/regentic_month')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.timestamps && data.timestamps.length > 0) {
+                        createRegenticChart(data.regenticValues, data.waterLevels, data.timestamps);
+                    }
+                })
+                .catch(error => console.error('Error fetching regentic chart data:', error));
+        }
+        
+        function createRegenticChart(regenticValues, waterLevels, timestamps) {
+            const ctx = document.getElementById('waterChart').getContext('2d');
+            
+            // Formatierte Labels mit Datum/Uhrzeit
+            const formattedLabels = timestamps.map(ts => formatTimestamp(ts));
+            
+            // Titel
+            const chartTitle = 'Regentic + Waterlevel: ' + formatTimestamp(timestamps[0]) + ' - ' + 
+                              formatTimestamp(timestamps[timestamps.length - 1]);
+            
+            if (chart) {
+                chart.destroy();
+            }
+            
+            chart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: formattedLabels,
+                    datasets: [
+                        {
+                            label: 'Regentic (Impulse)',
+                            data: regenticValues,
+                            backgroundColor: 'rgba(59, 130, 246, 0.1)',
+                            borderColor: 'rgba(59, 130, 246, 1)',
+                            borderWidth: 3,
+                            fill: true,
+                            tension: 0.4,
+                            pointBackgroundColor: 'rgba(59, 130, 246, 1)',
+                            pointBorderColor: '#fff',
+                            pointBorderWidth: 1,
+                            pointRadius: 3,
+                            pointHoverRadius: 6,
+                            yAxisID: 'y-regentic'
+                        },
+                        {
+                            label: 'Wasserstand (cm)',
+                            data: waterLevels,
+                            backgroundColor: 'rgba(16, 185, 129, 0.1)',
+                            borderColor: 'rgba(16, 185, 129, 1)',
+                            borderWidth: 3,
+                            fill: true,
+                            tension: 0.4,
+                            pointBackgroundColor: 'rgba(16, 185, 129, 1)',
+                            pointBorderColor: '#fff',
+                            pointBorderWidth: 1,
+                            pointRadius: 3,
+                            pointHoverRadius: 6,
+                            yAxisID: 'y-waterlevel'
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: {
+                        mode: 'index',
+                        intersect: false
+                    },
+                    plugins: {
+                        legend: {
+                            display: true,
+                            position: 'top',
+                            labels: {
+                                color: '#333',
+                                font: { size: 14 },
+                                usePointStyle: true
+                            }
+                        },
+                        title: {
+                            display: true,
+                            text: chartTitle,
+                            color: '#333',
+                            font: { size: 16, weight: 'bold' }
+                        },
+                        tooltip: {
+                            callbacks: {
+                                label: function(context) {
+                                    const datasetLabel = context.dataset.label;
+                                    const value = context.parsed.y;
+                                    if (datasetLabel.includes('Regentic')) {
+                                        return 'Regentic: ' + value.toFixed(0) + ' Impulse';
+                                    } else {
+                                        return 'Wasserstand: ' + value.toFixed(1) + ' cm';
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    scales: {
+                        'y-regentic': {
+                            type: 'linear',
+                            position: 'left',
+                            beginAtZero: true,
+                            ticks: {
+                                color: 'rgba(59, 130, 246, 1)',
+                                font: { size: 12 },
+                                callback: function(value) {
+                                    return value.toFixed(0);
+                                }
+                            },
+                            grid: { 
+                                color: 'rgba(59, 130, 246, 0.1)',
+                                drawOnChartArea: true
+                            },
+                            title: {
+                                display: true,
+                                text: 'Regentic (Impulse)',
+                                color: 'rgba(59, 130, 246, 1)',
+                                font: { size: 14, weight: 'bold' }
+                            }
+                        },
+                        'y-waterlevel': {
+                            type: 'linear',
+                            position: 'right',
+                            beginAtZero: false,
+                            min: 10.0,
+                            max: 40.0,
+                            ticks: {
+                                color: 'rgba(16, 185, 129, 1)',
+                                font: { size: 12 },
+                                stepSize: 5,
+                                callback: function(value) {
+                                    return value.toFixed(0) + ' cm';
+                                }
+                            },
+                            grid: { 
+                                drawOnChartArea: false
+                            },
+                            title: {
+                                display: true,
+                                text: 'Wasserstand (cm)',
+                                color: 'rgba(16, 185, 129, 1)',
+                                font: { size: 14, weight: 'bold' }
+                            }
+                        },
+                        x: {
+                            ticks: {
+                                color: '#333',
+                                font: { size: 11 },
+                                maxRotation: 45,
+                                minRotation: 45,
+                                autoSkip: true,
+                                maxTicksLimit: 10
+                            },
+                            grid: { 
+                                color: 'rgba(0, 0, 0, 0.1)'
+                            },
+                            title: {
+                                display: true,
+                                text: 'Datum / Uhrzeit',
+                                color: '#333',
+                                font: { size: 14, weight: 'bold' }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        
         function updateData() {
             fetch('/data')
                 .then(response => response.json())
@@ -2463,6 +3032,8 @@ void setup() {
                 updateChart();
             } else if (chartMode === 'month') {
                 updateMonthChart();
+            } else if (chartMode === 'regentic') {
+                updateRegenticChart();
             }
         }, 10000);
     </script>
@@ -2488,6 +3059,10 @@ void setup() {
     bool ok = backupAllFilesToSD();
     String msg = ok ? "Backup auf SD-Karte erfolgreich" : "Backup fehlgeschlagen (siehe Serial-Log)";
     request->send(ok ? 200 : 500, "text/plain", msg);
+  });
+  
+  server.on("/regentic_month", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send(200, "application/json", getRegenticChartDataMonth());
   });
   
   server.begin();
