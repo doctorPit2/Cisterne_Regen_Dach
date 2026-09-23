@@ -9,6 +9,16 @@
 #include "esp_wifi_types.h"
 #include <LittleFS.h>
 #include <ArduinoJson.h>
+#include <SPI.h>
+#include <SD.h>
+
+// SD-Karte an Standard-VSPI-Pins - eigene SPI-Instanz (HSPI), damit das TFT (nutzt das globale SPI/VSPI-Objekt) nicht gestoert wird
+#define SD_CS_PIN 5
+#define SD_SCK_PIN 18
+#define SD_MISO_PIN 19
+#define SD_MOSI_PIN 23
+SPIClass sdSPI(HSPI);
+bool sdCardAvailable = false;
 
 // WiFi-Konfiguration
 const char* ssid = "lenovo";  // Dein WLAN-Name
@@ -494,6 +504,65 @@ void saveAllData() {
   saveHistoryToFS();
   savePumpEventsToFS();
   saveCisterneDataToFS();
+}
+
+// ============================================================================
+// SD-Karten-Backup: Kopiert Dateien von LittleFS auf die SD-Karte
+// ============================================================================
+bool copyFileToSD(const char* path) {
+  if (!LittleFS.exists(path)) {
+    Serial.printf("Ueberspringe %s (nicht vorhanden)\n", path);
+    return false;
+  }
+
+  File src = LittleFS.open(path, "r");
+  if (!src) {
+    Serial.printf("Fehler beim Oeffnen von %s auf LittleFS\n", path);
+    return false;
+  }
+
+  File dst = SD.open(path, FILE_WRITE);
+  if (!dst) {
+    Serial.printf("Fehler beim Oeffnen von %s auf SD\n", path);
+    src.close();
+    return false;
+  }
+
+  static uint8_t buf[512];
+  size_t total = 0;
+  int n;
+  while ((n = src.read(buf, sizeof(buf))) > 0) {
+    dst.write(buf, n);
+    total += n;
+  }
+
+  src.close();
+  dst.close();
+  Serial.printf("Kopiert: %s (%u Bytes)\n", path, (unsigned)total);
+  return true;
+}
+
+bool backupAllFilesToSD() {
+  if (!sdCardAvailable) {
+    Serial.println("SD-Karte nicht verfuegbar - Backup uebersprungen");
+    return false;
+  }
+
+  Serial.println("=== Starte Backup: LittleFS -> SD-Karte ===");
+
+  const char* files[] = {
+    HISTORY_FILE, ARCHIVE_FILE, ARCHIVE_STATS_FILE, PUMP_FILE, CISTERNE_FILE
+  };
+
+  bool allOk = true;
+  for (const char* f : files) {
+    if (!copyFileToSD(f)) {
+      allOk = false;
+    }
+  }
+
+  Serial.println("=== Backup abgeschlossen ===");
+  return allOk;
 }
 
 void loadAllData() {
@@ -1544,6 +1613,17 @@ void setup() {
     loadAllData();
   }
   
+  // SD-Karte initialisieren ueber eigene HSPI-Instanz (kein Konflikt mit TFT-SPI/VSPI)
+  Serial.println("Initialisiere SD-Karte...");
+  sdSPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
+  if (!SD.begin(SD_CS_PIN, sdSPI, 4000000)) {
+    Serial.println("SD-Karte nicht gefunden oder Mount fehlgeschlagen");
+    sdCardAvailable = false;
+  } else {
+    Serial.println("SD-Karte erfolgreich gemountet");
+    sdCardAvailable = true;
+  }
+  
   // TFT initialisieren
   pinMode(TFT_BL, OUTPUT);
   digitalWrite(TFT_BL, HIGH);  // Backlight an
@@ -1955,6 +2035,12 @@ void setup() {
                 <div id="alarmCard" style="display:none;" class="data-card">
                     <div class="status status-alarm">⚠️ PUMPEN-ALARM ⚠️</div>
                 </div>
+                
+                <div class="data-card">
+                    <div class="data-label">SD-Karten-Backup</div>
+                    <button class="chart-button" id="btnBackup" onclick="triggerBackup()">💾 Backup starten</button>
+                    <div class="data-value-small" id="backupStatus" style="margin-top:8px;">--</div>
+                </div>
             </div>
         </div>
         
@@ -1990,6 +2076,27 @@ void setup() {
             const mins = Math.floor(seconds / 60);
             const secs = seconds % 60;
             return mins + ' min ' + secs + ' s';
+        }
+        
+        function triggerBackup() {
+            const btn = document.getElementById('btnBackup');
+            const status = document.getElementById('backupStatus');
+            btn.disabled = true;
+            status.textContent = 'Backup läuft...';
+            
+            fetch('/backup-sd')
+                .then(response => response.text().then(text => ({ok: response.ok, text})))
+                .then(result => {
+                    status.textContent = result.text;
+                    status.style.color = result.ok ? '#10b981' : '#ef4444';
+                })
+                .catch(error => {
+                    status.textContent = 'Fehler: ' + error;
+                    status.style.color = '#ef4444';
+                })
+                .finally(() => {
+                    btn.disabled = false;
+                });
         }
         
         function formatTimestamp(ts) {
@@ -2374,6 +2481,13 @@ void setup() {
   
   server.on("/chartdata_month", HTTP_GET, [](AsyncWebServerRequest *request){
     request->send(200, "application/json", getChartDataMonth());
+  });
+  
+  server.on("/backup-sd", HTTP_GET, [](AsyncWebServerRequest *request){
+    saveAllData();  // Sicherstellen, dass LittleFS aktuell ist
+    bool ok = backupAllFilesToSD();
+    String msg = ok ? "Backup auf SD-Karte erfolgreich" : "Backup fehlgeschlagen (siehe Serial-Log)";
+    request->send(ok ? 200 : 500, "text/plain", msg);
   });
   
   server.begin();
